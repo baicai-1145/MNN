@@ -1743,10 +1743,12 @@ kernel void flash_attention_fused(
         
         bool skip_block = false;
 
-        // Block mask all -inf
+        // Block mask all -inf. This is only valid for causal attention.
+#ifdef CAUSAL_MASK
         if(t_blk > global_r) {
             skip_block = true;
         }
+#endif
 
 #if 0
         // ============================================================
@@ -1890,7 +1892,9 @@ kernel void flash_attention_fused(
                     #elif defined(CAUSAL_MASK)
                         // Causal mask: keep if ti <= query_pos + (kv_len - query_seq_len), else -inf
                         int query_pos = sl_blk * Q_BLOCK + ltid;
-                        if (ti > query_pos + (kv_len - param.query_seq_len)) val = -FLT_MAX;
+                        if (ti >= kv_len || ti > query_pos + (kv_len - param.query_seq_len)) val = -FLT_MAX;
+                    #else
+                        if (ti >= kv_len) val = -FLT_MAX;
                     #endif
                     
                     sdata_work[ltid * 16 + j] = val;
@@ -1917,47 +1921,51 @@ kernel void flash_attention_fused(
             // --- Step D: P * V ---
             for (int iter = 0; iter < 2; ++iter) { 
                 int d_tile = sgitg * 2 + iter;
-                if (d_tile * 16 >= head_dim) continue;
+                bool valid_tile = d_tile * 16 < head_dim;
                 
                 // 注意：这里继续使用 sdata_scratch (offset 512) 没问题，
                 // 因为它只在 Block 计算内部使用，不会跨 Block 影响 Skip 逻辑。
                 // 且 Skip Flag 已经用完了。
                 threadgroup float* my_scratch = sdata_work + 512 + sgitg * 128;
                 
-                simdgroup_store(acc_reg[iter][0], my_scratch, 16);     
-                simdgroup_store(acc_reg[iter][1], my_scratch + 8, 16); 
+                if (valid_tile) {
+                    simdgroup_store(acc_reg[iter][0], my_scratch, 16);
+                    simdgroup_store(acc_reg[iter][1], my_scratch + 8, 16);
+                }
                 threadgroup_barrier(mem_flags::mem_threadgroup);
                 
-                if (tiisg < 8) {
+                if (valid_tile && tiisg < 8) {
                     float sc = sdata_scale[tiisg];
                     #pragma unroll
                     for (int j=0; j<16; ++j) my_scratch[tiisg * 16 + j] *= sc;
                 }
                 threadgroup_barrier(mem_flags::mem_threadgroup);
                 
-                simdgroup_load(acc_reg[iter][0], my_scratch, 16);
-                simdgroup_load(acc_reg[iter][1], my_scratch + 8, 16);
+                if (valid_tile) {
+                    simdgroup_load(acc_reg[iter][0], my_scratch, 16);
+                    simdgroup_load(acc_reg[iter][1], my_scratch + 8, 16);
 
-                threadgroup ftype* sdata_p = (threadgroup ftype*)sdata_work;
-                simdgroup_T8x8 sgp[2];
-                simdgroup_load(sgp[0], sdata_p, 16, ulong2(0), false); 
-                simdgroup_load(sgp[1], sdata_p + 8, 16, ulong2(0), false); 
+                    threadgroup ftype* sdata_p = (threadgroup ftype*)sdata_work;
+                    simdgroup_T8x8 sgp[2];
+                    simdgroup_load(sgp[0], sdata_p, 16, ulong2(0), false);
+                    simdgroup_load(sgp[1], sdata_p + 8, 16, ulong2(0), false);
 
-                int d_start = d_tile * 16;
-                const device ftype* v_curr = value + v_base + d_start * max_kv_len + t_blk;
+                    int d_start = d_tile * 16;
+                    const device ftype* v_curr = value + v_base + d_start * max_kv_len + t_blk;
                 
-                simdgroup_T8x8 sgv[4];
-                simdgroup_barrier(mem_flags::mem_none);
-                simdgroup_load(sgv[0], v_curr, max_kv_len, ulong2(0), true);
-                simdgroup_load(sgv[1], v_curr + 8 * max_kv_len, max_kv_len, ulong2(0), true);
-                simdgroup_load(sgv[2], v_curr + 8, max_kv_len, ulong2(0), true);
-                simdgroup_load(sgv[3], v_curr + 8 * max_kv_len + 8, max_kv_len, ulong2(0), true);
-                simdgroup_barrier(mem_flags::mem_none);
+                    simdgroup_T8x8 sgv[4];
+                    simdgroup_barrier(mem_flags::mem_none);
+                    simdgroup_load(sgv[0], v_curr, max_kv_len, ulong2(0), true);
+                    simdgroup_load(sgv[1], v_curr + 8 * max_kv_len, max_kv_len, ulong2(0), true);
+                    simdgroup_load(sgv[2], v_curr + 8, max_kv_len, ulong2(0), true);
+                    simdgroup_load(sgv[3], v_curr + 8 * max_kv_len + 8, max_kv_len, ulong2(0), true);
+                    simdgroup_barrier(mem_flags::mem_none);
                 
-                simdgroup_multiply_accumulate(acc_reg[iter][0], sgp[0], sgv[0], acc_reg[iter][0]);
-                simdgroup_multiply_accumulate(acc_reg[iter][0], sgp[1], sgv[2], acc_reg[iter][0]);
-                simdgroup_multiply_accumulate(acc_reg[iter][1], sgp[0], sgv[1], acc_reg[iter][1]);
-                simdgroup_multiply_accumulate(acc_reg[iter][1], sgp[1], sgv[3], acc_reg[iter][1]);
+                    simdgroup_multiply_accumulate(acc_reg[iter][0], sgp[0], sgv[0], acc_reg[iter][0]);
+                    simdgroup_multiply_accumulate(acc_reg[iter][0], sgp[1], sgv[2], acc_reg[iter][0]);
+                    simdgroup_multiply_accumulate(acc_reg[iter][1], sgp[0], sgv[1], acc_reg[iter][1]);
+                    simdgroup_multiply_accumulate(acc_reg[iter][1], sgp[1], sgv[3], acc_reg[iter][1]);
+                }
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);
         } // End of if (!skip_block)
@@ -1973,13 +1981,15 @@ kernel void flash_attention_fused(
     
     for (int iter = 0; iter < 2; ++iter) {
         int d_tile = sgitg * 2 + iter; 
-        if (d_tile * 16 >= head_dim) continue;
+        bool valid_tile = d_tile * 16 < head_dim;
         
-        simdgroup_store(acc_reg[iter][0], my_out_buf, 16);
-        simdgroup_store(acc_reg[iter][1], my_out_buf + 8, 16);
+        if (valid_tile) {
+            simdgroup_store(acc_reg[iter][0], my_out_buf, 16);
+            simdgroup_store(acc_reg[iter][1], my_out_buf + 8, 16);
+        }
         simdgroup_barrier(mem_flags::mem_threadgroup);
         
-        if (tiisg < 8) {
+        if (valid_tile && tiisg < 8) {
             float inv_sum = 1.0f / sdata_final_sum[tiisg];
             int qi = sl_blk * Q_BLOCK + tiisg;
             if (qi < q_seq_len) {
@@ -2122,4 +2132,3 @@ kernel void flash_attention_fused(
 
 #endif/* MNN_SUPPORT_TRANSFORMER_FUSE */
 #endif
-

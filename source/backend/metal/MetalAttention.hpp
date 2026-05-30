@@ -10,6 +10,7 @@
 #define MetalAttention_hpp
 
 #import "core/Macro.h"
+#import "MetalExecution.hpp"
 #import "MetalBackend.hpp"
 #include "MNN_generated.h"
 #include "core/OpCommonUtils.hpp"
@@ -95,4 +96,3 @@ private:
 #endif/* MNN_SUPPORT_TRANSFORMER_FUSE */
 #endif/* MNN_METAL_ENABLED */
 #endif/* MetalAttention_hpp */
-

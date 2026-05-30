@@ -15,6 +15,7 @@
   extern void ___MetalTopKV2Creator__OpType_TopKV2__();
 #ifdef MNN_SUPPORT_TRANSFORMER_FUSE
   extern void ___AttentionBufCreator__OpType_Attention__();
+  extern void ___MetalFmhaV2Creator__OpType_FmhaV2__();
   extern void ___MetalLinearAttentionCreator__OpType_LinearAttention__();
 #endif
   extern void ___MetalMatMulCreator__OpType_MatMul__();
@@ -69,6 +70,7 @@ void registerMetalOps() {
    ___MetalReLU6Creator__OpType_ReLU__();
 #ifdef MNN_SUPPORT_TRANSFORMER_FUSE
    ___AttentionBufCreator__OpType_Attention__();
+   ___MetalFmhaV2Creator__OpType_FmhaV2__();
    ___MetalLinearAttentionCreator__OpType_LinearAttention__();
 #endif
 }
