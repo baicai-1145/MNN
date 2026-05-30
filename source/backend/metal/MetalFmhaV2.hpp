@@ -31,17 +31,25 @@ private:
         int seq_len;
         int heads;
         int head_dim;
+        int cos_batch;
+        int packed_dim;
     };
 
-    void compileSplitKernel();
+    void compileSplitKernel(bool applyRotary, bool packedGate);
 
     int mHeads = 0;
     int mHeadDim = 0;
     int mBatch = 0;
     int mSeqLen = 0;
+    bool mPackedInput = true;
+    bool mApplyRotary = false;
+    bool mApplyGate = false;
+    bool mPackedGate = false;
+    int mGateInputIndex = -1;
     std::shared_ptr<Tensor> mQ;
     std::shared_ptr<Tensor> mK;
     std::shared_ptr<Tensor> mV;
+    std::shared_ptr<Tensor> mGate;
     std::shared_ptr<AttentionBufExecution> mAttention;
     id<MTLComputePipelineState> mSplitKernel = nil;
     id<MTLBuffer> mSplitParam = nil;

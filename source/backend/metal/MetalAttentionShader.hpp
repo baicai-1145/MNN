@@ -738,6 +738,9 @@ kernel void prefill_qkv_tensor(const device ftype* input0 [[buffer(0)]],
     device ftype4* past_value [[buffer(2)]],
     constant int &seq_idx [[buffer(3)]],
     constant Param& param [[buffer(4)]],
+#ifdef APPLY_GATE
+    const device ftype* gate [[buffer(5)]],
+#endif
     uint3 gid[[threadgroup_position_in_grid]],
     uint tiitg[[thread_index_in_threadgroup]],
     uint tiisg[[thread_index_in_simdgroup]],
@@ -857,11 +860,16 @@ kernel void prefill_qkv_tensor(const device ftype* input0 [[buffer(0)]],
     // [mBatch, mSeqLen, mNumHead, mHeadDim]
     auto xy_out = output + ((b * q_seq_len + seq_idx * q_seq_piece_len + sl * 32 + mcl) * head_num + hn) * head_dim/4 + (hm * 4 + ncl) * 2 + 0;
     if(sl * 32 + mcl < q_seq_piece_len && seq_idx * q_seq_piece_len + sl * 32 + mcl < q_seq_len) {
+#ifdef APPLY_GATE
+        const ftype gate_value = gate[(b * q_seq_len + seq_idx * q_seq_piece_len + sl * 32 + mcl) * head_num + hn];
+#else
+        const ftype gate_value = (ftype)1;
+#endif
         if((hm * 4 + ncl) * 2 + 0 < head_dim/4) {
-            xy_out[0] =  ftype4(((threadgroup float4*)sdata)[sindex_base + 0]);
+            xy_out[0] =  ftype4(((threadgroup float4*)sdata)[sindex_base + 0]) * gate_value;
         }
         if((hm * 4 + ncl) * 2 + 1 < head_dim/4) {
-            xy_out[1] =  ftype4(((threadgroup float4*)sdata)[sindex_base + 1]);
+            xy_out[1] =  ftype4(((threadgroup float4*)sdata)[sindex_base + 1]) * gate_value;
         }
     }
 
@@ -874,6 +882,9 @@ kernel void prefill_qkv(const device ftype* input0 [[buffer(0)]],
     device ftype* past_value [[buffer(2)]],
     constant int &seq_idx [[buffer(3)]],
     constant Param& param [[buffer(4)]],
+#ifdef APPLY_GATE
+    const device ftype* gate [[buffer(5)]],
+#endif
 #ifdef SIMD_GROUP_MATRIX
     uint3 gid[[threadgroup_position_in_grid]],
     uint tiitg[[thread_index_in_threadgroup]],
@@ -1021,29 +1032,34 @@ kernel void prefill_qkv(const device ftype* input0 [[buffer(0)]],
     // [mBatch, mSeqLen, mNumHead, mHeadDim]
     auto xy_out = output + ((b * q_seq_len + seq_idx * q_seq_piece_len + sl * 16 + rcl) * head_num + hn) * head_dim + hm * 16 + kl * 8 + 0;
     if(sl * 16 + rcl < q_seq_piece_len && seq_idx * q_seq_piece_len + sl * 16 + rcl < q_seq_len) {
+#ifdef APPLY_GATE
+        const ftype gate_value = gate[(b * q_seq_len + seq_idx * q_seq_piece_len + sl * 16 + rcl) * head_num + hn];
+#else
+        const ftype gate_value = (ftype)1;
+#endif
         if(hm * 16 + kl * 8 + 0 < head_dim) {
-            xy_out[0] =  ((threadgroup float*)sdata)[sindex_base + 0];
+            xy_out[0] =  ((ftype)((threadgroup float*)sdata)[sindex_base + 0]) * gate_value;
         }
         if(hm * 16 + kl * 8 + 1 < head_dim) {
-            xy_out[1] =  ((threadgroup float*)sdata)[sindex_base + 1];
+            xy_out[1] =  ((ftype)((threadgroup float*)sdata)[sindex_base + 1]) * gate_value;
         }
         if(hm * 16 + kl * 8 + 2 < head_dim) {
-            xy_out[2] =  ((threadgroup float*)sdata)[sindex_base + 2];
+            xy_out[2] =  ((ftype)((threadgroup float*)sdata)[sindex_base + 2]) * gate_value;
         }
         if(hm * 16 + kl * 8 + 3 < head_dim) {
-            xy_out[3] =  ((threadgroup float*)sdata)[sindex_base + 3];
+            xy_out[3] =  ((ftype)((threadgroup float*)sdata)[sindex_base + 3]) * gate_value;
         }
         if(hm * 16 + kl * 8 + 4 < head_dim) {
-            xy_out[4] =  ((threadgroup float*)sdata)[sindex_base + 4];
+            xy_out[4] =  ((ftype)((threadgroup float*)sdata)[sindex_base + 4]) * gate_value;
         }
         if(hm * 16 + kl * 8 + 5 < head_dim) {
-            xy_out[5] =  ((threadgroup float*)sdata)[sindex_base + 5];
+            xy_out[5] =  ((ftype)((threadgroup float*)sdata)[sindex_base + 5]) * gate_value;
         }
         if(hm * 16 + kl * 8 + 6 < head_dim) {
-            xy_out[6] =  ((threadgroup float*)sdata)[sindex_base + 6];
+            xy_out[6] =  ((ftype)((threadgroup float*)sdata)[sindex_base + 6]) * gate_value;
         }
         if(hm * 16 + kl * 8 + 7 < head_dim) {
-            xy_out[7] =  ((threadgroup float*)sdata)[sindex_base + 7];
+            xy_out[7] =  ((ftype)((threadgroup float*)sdata)[sindex_base + 7]) * gate_value;
         }
     }
 
@@ -1082,7 +1098,12 @@ kernel void prefill_qkv(const device ftype* input0 [[buffer(0)]],
         out += A0 * B;
     }
     // [mBatch, mSeqLen, mNumHead, mHeadDim]
-    output[(b * q_seq_len + q_idx) * stride * group + (hn * head_dim + z)] = out;
+#ifdef APPLY_GATE
+    const ftype gate_value = gate[(b * q_seq_len + q_idx) * head_num + hn];
+#else
+    const ftype gate_value = (ftype)1;
+#endif
+    output[(b * q_seq_len + q_idx) * stride * group + (hn * head_dim + z)] = ((ftype)out) * gate_value;
 #endif
 }
 
@@ -1092,6 +1113,9 @@ kernel void decode_qkv(const device ftype* input0 [[buffer(0)]],
     // docode actually not compute in block
     constant int &seq_idx [[buffer(3)]],
     constant Param& param [[buffer(4)]],
+#ifdef APPLY_GATE
+    const device ftype* gate [[buffer(5)]],
+#endif
 #ifdef SIMD_GROUP_REDUCE
     uint3 gid[[threadgroup_position_in_grid]],
     uint  tiisg[[thread_index_in_simdgroup]],
@@ -1133,7 +1157,12 @@ kernel void decode_qkv(const device ftype* input0 [[buffer(0)]],
     out = simd_sum(out);
     if(tiisg == 0) {
         // [mBatch, mSeqLen, mNumHead, mHeadDim]
-        output[((b * q_seq_len + x) * head_num + hn) * head_dim + z] = (ftype)out;
+#ifdef APPLY_GATE
+        const ftype gate_value = gate[(b * q_seq_len + x) * head_num + hn];
+#else
+        const ftype gate_value = (ftype)1;
+#endif
+        output[((b * q_seq_len + x) * head_num + hn) * head_dim + z] = ((ftype)out) * gate_value;
     }
 #else
     for(int i = 0; i < value_seq_len; i++){
@@ -1142,7 +1171,12 @@ kernel void decode_qkv(const device ftype* input0 [[buffer(0)]],
         
         out += A * B;
     }
-    output[((b * q_seq_len + x) * head_num + hn) * head_dim + z] = (ftype)out;
+#ifdef APPLY_GATE
+    const ftype gate_value = gate[(b * q_seq_len + x) * head_num + hn];
+#else
+    const ftype gate_value = (ftype)1;
+#endif
+    output[((b * q_seq_len + x) * head_num + hn) * head_dim + z] = ((ftype)out) * gate_value;
 #endif
 }
 )metal";
@@ -1582,6 +1616,9 @@ kernel void flash_scale(
     device ftype* Output [[buffer(1)]],
     const device float* runningStats [[buffer(2)]],
     constant Param& param [[buffer(3)]],
+#ifdef APPLY_GATE
+    const device ftype* gate [[buffer(4)]],
+#endif
     uint3 gid [[thread_position_in_grid]]
 ) {
     int d_vec = gid.x;
@@ -1600,11 +1637,16 @@ kernel void flash_scale(
     int h = bh % param.head_num;
     
     int out_idx = ((b * param.query_seq_len + s) * param.head_num + h) * param.head_dim + d_vec * 4;
+#ifdef APPLY_GATE
+    const ftype gate_value = gate[(b * param.query_seq_len + s) * param.head_num + h];
+#else
+    const ftype gate_value = (ftype)1;
+#endif
     
-    Output[out_idx]   = (ftype)(inv_sum * (float)Input[out_idx]  );
-    Output[out_idx+1] = (ftype)(inv_sum * (float)Input[out_idx+1]);
-    Output[out_idx+2] = (ftype)(inv_sum * (float)Input[out_idx+2]);
-    Output[out_idx+3] = (ftype)(inv_sum * (float)Input[out_idx+3]);
+    Output[out_idx]   = ((ftype)(inv_sum * (float)Input[out_idx]  )) * gate_value;
+    Output[out_idx+1] = ((ftype)(inv_sum * (float)Input[out_idx+1])) * gate_value;
+    Output[out_idx+2] = ((ftype)(inv_sum * (float)Input[out_idx+2])) * gate_value;
+    Output[out_idx+3] = ((ftype)(inv_sum * (float)Input[out_idx+3])) * gate_value;
 }
 )metal";
 
@@ -1662,6 +1704,9 @@ kernel void flash_attention_fused(
     const device ftype* mask [[buffer(3)]],
     device ftype* output [[buffer(4)]],
     constant Param& param [[buffer(5)]],
+#ifdef APPLY_GATE
+    const device ftype* gate [[buffer(6)]],
+#endif
     uint ltid [[thread_index_in_threadgroup]],      // 0..127 global inside group
 #if defined(SIMD_GROUP_REDUCE)
     uint3 gid [[thread_position_in_grid]],
@@ -1994,10 +2039,15 @@ kernel void flash_attention_fused(
             int qi = sl_blk * Q_BLOCK + tiisg;
             if (qi < q_seq_len) {
                 device ftype* out_ptr = output + ((b * q_seq_len + qi) * param.head_num + h) * head_dim + d_tile * 16;
+#ifdef APPLY_GATE
+                const ftype gate_value = gate[(b * q_seq_len + qi) * param.head_num + h];
+#else
+                const ftype gate_value = (ftype)1;
+#endif
                 #pragma unroll
                 for (int j=0; j<16; ++j) {
                     if (d_tile * 16 + j < head_dim) {
-                        out_ptr[j] = (ftype)(my_out_buf[tiisg * 16 + j] * inv_sum);
+                        out_ptr[j] = ((ftype)(my_out_buf[tiisg * 16 + j] * inv_sum)) * gate_value;
                     }
                 }
             }
@@ -2120,10 +2170,15 @@ kernel void flash_attention_fused(
     
     // Write output
     auto out_ptr = output + ((b * param.query_seq_len + s) * param.head_num + h) * head_dim;
+#ifdef APPLY_GATE
+    const ftype gate_value = gate[(b * param.query_seq_len + s) * param.head_num + h];
+#else
+    const ftype gate_value = (ftype)1;
+#endif
     for (int i = 0; i < d_per_thread; ++i) {
         int d = tid + i * 32;
         if (d < head_dim) {
-            out_ptr[d] = (ftype)(acc[i] * inv_sum);
+            out_ptr[d] = ((ftype)(acc[i] * inv_sum)) * gate_value;
         }
     }
 #endif

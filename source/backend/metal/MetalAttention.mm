@@ -30,8 +30,8 @@ struct Param {
     int batch;
     int kv_align_len;
 };
-AttentionBufExecution::AttentionBufExecution(Backend *backend, bool kv_cahce)
-    : MetalExecution(backend) , mKVCache(kv_cahce) {
+AttentionBufExecution::AttentionBufExecution(Backend *backend, bool kv_cahce, bool allow_gate)
+    : MetalExecution(backend) , mKVCache(kv_cahce), mAllowGateInput(allow_gate) {
     _init();
 }
 void AttentionBufExecution::_init() {
@@ -87,6 +87,9 @@ void AttentionBufExecution::compilerShader(const std::vector<Tensor *> &inputs) 
     if(mQkvSimdReduce) {
         qkvKeys.emplace_back("SIMD_GROUP_REDUCE");
     }
+    if(mHasGate) {
+        qkvKeys.emplace_back("APPLY_GATE");
+    }
     std::vector<std::string> qkPrefillKeys = {
         {"matmul_qk_div_mask", ftype, group_str, "FOR_PREFILL"}
     };
@@ -117,6 +120,9 @@ void AttentionBufExecution::compilerShader(const std::vector<Tensor *> &inputs) 
     };
     if(mQkvSimdMatrix) {
         qkvPrefillKeys.emplace_back("SIMD_GROUP_MATRIX");
+    }
+    if(mHasGate) {
+        qkvPrefillKeys.emplace_back("APPLY_GATE");
     }
     if (mtbn->useFp16InsteadFp32()) {
         qkPrefillKeys.emplace_back("MNN_METAL_FLOAT16_STORAGE");
@@ -261,6 +267,10 @@ void AttentionBufExecution::compilerShader(const std::vector<Tensor *> &inputs) 
         }
         {
             NSMutableDictionary *dic = [basicDic mutableCopy];
+            if(mHasGate) {
+                [dic setValue:@"1" forKey:@"APPLY_GATE"];
+                flashKeys[2].emplace_back("APPLY_GATE");
+            }
             option.preprocessorMacros = dic;
             
             auto pipeline = rt->findPipeline(flashKeys[2]);
@@ -295,6 +305,10 @@ void AttentionBufExecution::compilerShader(const std::vector<Tensor *> &inputs) 
             if (mtbn->useFp16InsteadFp32()) {
                 [dic setValue:@"1" forKey:@"MNN_METAL_FLOAT16_STORAGE"];
                 keys.emplace_back("MNN_METAL_FLOAT16_STORAGE");
+            }
+            if(mHasGate) {
+                [dic setValue:@"1" forKey:@"APPLY_GATE"];
+                keys.emplace_back("APPLY_GATE");
             }
             if(mHasMask) {
                  if(mIsAddMask) {
@@ -389,18 +403,28 @@ void AttentionBufExecution::handleKVAllocMemory() {
     }
 }
 ErrorCode AttentionBufExecution::onResize(const std::vector<Tensor *> &inputs, const std::vector<Tensor *> &outputs) {
-    mHasMask = inputs.size() > 3;
+    mHasGate = mAllowGateInput && inputs.size() > 3 && inputs[3]->dimensions() == 3;
+    if (mHasGate) {
+        auto query = inputs[0];
+        if (inputs[3]->length(0) != query->length(0) ||
+            inputs[3]->length(1) != query->length(1) ||
+            inputs[3]->length(2) != query->length(2)) {
+            return NOT_SUPPORT;
+        }
+    }
+    const int maskIndex = mHasGate ? 4 : 3;
+    mHasMask = inputs.size() > maskIndex;
     mCausalMaskScalar = false;
     if (mHasMask) {
         // In transformer graphs / unit tests, a scalar mask input is a placeholder that means:
         // apply causal(lower-triangular) mask inside Attention, instead of providing an explicit mask matrix.
         // See `AttentionTest::generateMask()` for the expected rule:
         //   keep if (j - i) <= (kv_len - q_len), else mask to -inf.
-        if (inputs[3]->elementSize() <= 1) {
+        if (inputs[maskIndex]->elementSize() <= 1) {
             mCausalMaskScalar = true;
             mHasMask = false; // don't bind mask buffer; shader will generate causal mask
         } else {
-            mIsAddMask = (inputs[3]->getType() == halide_type_of<float>());
+            mIsAddMask = (inputs[maskIndex]->getType() == halide_type_of<float>());
         }
     }
     auto query = inputs[0];
@@ -608,7 +632,7 @@ void AttentionBufExecution::onEncode(const std::vector<Tensor *> &inputs, const 
                 [encoder setBytes:&kv_start length:sizeof(kv_start) atIndex:5];
                 [encoder setBytes:&current_block_len length:sizeof(int) atIndex:6];
                 if(mHasMask && !mCausalMaskScalar) {
-                    MetalBackend::setTensor(inputs[3], encoder, 7);
+                    MetalBackend::setTensor(inputs[mHasGate ? 4 : 3], encoder, 7);
                 }
 
                 int decode_grid_y = mBatch * mNumHead;
@@ -681,6 +705,9 @@ void AttentionBufExecution::onEncode(const std::vector<Tensor *> &inputs, const 
                 }
                 [encoder setBytes:&seq_idx length:sizeof(seq_idx) atIndex:3];
                 [encoder setBuffer:mParamQKV offset:0 atIndex:4];
+                if(mHasGate) {
+                    MetalBackend::setTensor(inputs[3], encoder, 5);
+                }
                 std::pair<MTLSize, MTLSize> gl;
                 if(mQkvSimdReduce) {
                     gl = std::make_pair(MTLSizeMake(seqLenPiece, mBatch * mNumHead, mHeadDim), MTLSizeMake(32, 1, 1));
@@ -708,10 +735,13 @@ void AttentionBufExecution::onEncode(const std::vector<Tensor *> &inputs, const 
                 MetalBackend::setTensor(tempTensorV, encoder, 2);
             }
             if(mHasMask && !mCausalMaskScalar) {
-                 MetalBackend::setTensor(inputs[3], encoder, 3);
+                 MetalBackend::setTensor(inputs[mHasGate ? 4 : 3], encoder, 3);
             }
             MetalBackend::setTensor(outputs[0], encoder, 4);
             [encoder setBuffer:mParamQKV offset:0 atIndex:5];
+            if(mHasGate) {
+                MetalBackend::setTensor(inputs[3], encoder, 6);
+            }
             
             // TEMPORARY: Revert to stable configuration for debugging
             // Grid: [q_seqlen/16, batch*headNum, 1], Threadgroup: 32 threads
@@ -758,7 +788,7 @@ void AttentionBufExecution::onEncode(const std::vector<Tensor *> &inputs, const 
                     [encoder setBytes:&kv_start length:sizeof(kv_start) atIndex:5];
                     [encoder setBytes:&current_block_len length:sizeof(int) atIndex:6];
                     if(mHasMask && !mCausalMaskScalar) {
-                        MetalBackend::setTensor(inputs[3], encoder, 7);
+                        MetalBackend::setTensor(inputs[mHasGate ? 4 : 3], encoder, 7);
                     }
                     
                     int decode_grid_y = mBatch * mNumHead;
@@ -836,6 +866,9 @@ void AttentionBufExecution::onEncode(const std::vector<Tensor *> &inputs, const 
                 MetalBackend::setTensor(outputs[0], encoder, 1);
                 MetalBackend::setTensor(mRunningStats.get(), encoder, 2);
                 [encoder setBuffer:mParamQKV offset:0 atIndex:3];
+                if(mHasGate) {
+                    MetalBackend::setTensor(inputs[3], encoder, 4);
+                }
                 
                 auto gl = [context computeBestGroupAndLocal:mKernel_flash_scale threads:MTLSizeMake(UP_DIV(mHeadDim, 4), mSeqLen, mBatch * mNumHead)];
                 [encoder dispatchThreadgroups:gl.first threadsPerThreadgroup:gl.second];
@@ -862,4 +895,3 @@ REGISTER_METAL_OP_TRANSFORMER_CREATOR(AttentionBufCreator, OpType_Attention);
 } // namespace MNN
 #endif/* MNN_SUPPORT_TRANSFORMER_FUSE */
 #endif
-

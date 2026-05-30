@@ -41,8 +41,33 @@
         temp_1 = (FLOAT4)0;\
     }
 
+#ifdef APPLY_ROTARY
+#define APPLY_ROTARY_TO_TEMP(seq_sl) \
+    {\
+        const int cb = cos_batch == 1 ? 0 : b;\
+        const int rot_offset = ((((seq_sl) * cos_batch + cb) * (head_dim / 2) + 2 * hd) * 4);\
+        FLOAT4 cos_0 = vload4(0, cos + rot_offset);\
+        FLOAT4 sin_0 = vload4(0, sin + rot_offset);\
+        FLOAT4 cos_1 = vload4(0, cos + rot_offset + 4);\
+        FLOAT4 sin_1 = vload4(0, sin + rot_offset + 4);\
+        FLOAT4 even_0 = temp_0;\
+        FLOAT4 odd_0 = temp_1;\
+        FLOAT4 even_1 = temp_2;\
+        FLOAT4 odd_1 = temp_3;\
+        temp_0 = even_0 * cos_0 - odd_0 * sin_0;\
+        temp_1 = odd_0 * cos_0 + even_0 * sin_0;\
+        temp_2 = even_1 * cos_1 - odd_1 * sin_1;\
+        temp_3 = odd_1 * cos_1 + even_1 * sin_1;\
+    }
+#else
+#define APPLY_ROTARY_TO_TEMP(seq_sl)
+#endif
+
 __kernel void split_transpose_qkv(GLOBAL_SIZE_3_DIMS
                               __global const FLOAT *input, // [Batch, seqLen/4, mNumHead * 3 * mHeadDim, 4]
+                              __global const FLOAT *cos,
+                              __global const FLOAT *sin,
+                              __private const int cos_batch,
                               __global FLOAT *output_q, // [Batch * mNumHead, head_dim_pack_k, seq_len_pack_mn / qSeqSplitNum]
                               __global FLOAT *output_k, // [Batch * mNumHead, head_dim_pack_k, seq_len_pack_mn]
                               __global FLOAT *output_v, // [Batch * mNumHead, ROUND_UP(seqLen, tile), head_dim_pack_mn]
@@ -93,6 +118,7 @@ __kernel void split_transpose_qkv(GLOBAL_SIZE_3_DIMS
             #ifdef SEQLEN_LEAVE
             DEAL_SEQ_LEN_NOT_ALIGN
             #endif
+            APPLY_ROTARY_TO_TEMP(seq_index * seq_len_piece / 4 + sl)
             vstore4(temp_0, 0, output_q + offset_q);
             vstore4(temp_1, 0, output_q + offset_q + seq_len_piece);
             vstore4(temp_2, 0, output_q + offset_q + seq_len_piece + seq_len_piece);
@@ -139,6 +165,7 @@ __kernel void split_transpose_qkv(GLOBAL_SIZE_3_DIMS
         #ifdef SEQLEN_LEAVE
         DEAL_SEQ_LEN_NOT_ALIGN
         #endif
+        APPLY_ROTARY_TO_TEMP(sl)
         vstore4(temp_0, 0, output_q + offset_q);
         vstore4(temp_1, 0, output_q + offset_q + seq_len_piece);
         vstore4(temp_2, 0, output_q + offset_q + seq_len_piece + seq_len_piece);
@@ -157,6 +184,7 @@ __kernel void split_transpose_qkv(GLOBAL_SIZE_3_DIMS
         #ifdef SEQLEN_LEAVE
         DEAL_SEQ_LEN_NOT_ALIGN
         #endif
+        APPLY_ROTARY_TO_TEMP(sl)
         
         vstore4(temp_0, 0, output_k + offset_k);
         vstore4(temp_1, 0, output_k + offset_k + seq_len_pack_mn);
@@ -336,6 +364,7 @@ __kernel void trans_3d_buf(GLOBAL_SIZE_3_DIMS
 __kernel void clip_transpose_qkv(GLOBAL_SIZE_3_DIMS
                               __global const FLOAT *input, // [Batch * mNumHead, ROUND_UP(mHeadDim, tile), ROUND_UP(seqLen, tile)]
                               __global FLOAT *output, // [Batch, seqLen/4, mNumHead * mHeadDim, 4]
+                              __global const FLOAT *gate, // [Batch, seqLen/4, mNumHead, 4]
                               __private const int tile,
                               __private const int seq_len,
                               __private const int seq_len_piece,
@@ -370,6 +399,15 @@ __kernel void clip_transpose_qkv(GLOBAL_SIZE_3_DIMS
     FLOAT4 temp_1 = vload4(0, input + offset_inp + seq_len_pack);
     FLOAT4 temp_2 = vload4(0, input + offset_inp + 2 * seq_len_pack);
     FLOAT4 temp_3 = vload4(0, input + offset_inp + 3 * seq_len_pack);
+
+    #ifdef APPLY_GATE
+    const int offset_gate = (((seq_index * seq_len_piece / 4 + sl) * batch + b) * head_num + hn) * 4;
+    const FLOAT4 gate_value = vload4(0, gate + offset_gate);
+    temp_0 *= gate_value;
+    temp_1 *= gate_value;
+    temp_2 *= gate_value;
+    temp_3 *= gate_value;
+    #endif
     
     vstore4(temp_0, 0, output + offset_out);
     if(4 * hd + 1 > head_dim) return;

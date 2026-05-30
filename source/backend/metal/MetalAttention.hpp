@@ -22,7 +22,7 @@
 namespace MNN {
 class AttentionBufExecution : public MetalExecution {
 public:
-    AttentionBufExecution(Backend *backend, bool kv_cache);
+    AttentionBufExecution(Backend *backend, bool kv_cache, bool allow_gate = false);
     virtual ~AttentionBufExecution() = default;
     virtual ErrorCode onResize(const std::vector<Tensor *> &inputs, const std::vector<Tensor *> &outputs) override;
 
@@ -31,7 +31,7 @@ public:
         if (nullptr == dst) {
             return true;
         }
-        auto exe = new AttentionBufExecution(bn, mKVCache);
+        auto exe = new AttentionBufExecution(bn, mKVCache, mAllowGateInput);
         if (bn->getMetaPtr() == backend()->getMetaPtr()) {
             exe->mKVCacheManager = mKVCacheManager;
         }
@@ -44,6 +44,8 @@ private:
     void compilerShader(const std::vector<Tensor *> &inputs);
     void handleKVAllocMemory();
     bool mKVCache;
+    bool mAllowGateInput = false;
+    bool mHasGate = false;
     std::shared_ptr<MetalKVCacheManager> mKVCacheManager = nullptr;
     float mScale;
     bool mShortSeq = false;

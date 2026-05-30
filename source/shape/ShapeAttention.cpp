@@ -17,12 +17,28 @@ class FmhaV2SizeComputer : public SizeComputer {
     virtual bool onComputeSize(const MNN::Op* op, const std::vector<Tensor*>& inputs,
                                const std::vector<Tensor*>& outputs) const override {
         auto input0 = inputs[0], output0 = outputs[0];
-        MNN_ASSERT(inputs.size() == 1);
-        MNN_ASSERT(input0->buffer().dimensions == 3);
+        if (inputs.size() < 1 || inputs.size() > 4) {
+            return false;
+        }
 
-        output0->buffer().dim[0].extent = input0->buffer().dim[0].extent;
-        output0->buffer().dim[1].extent = input0->buffer().dim[1].extent;
-        output0->buffer().dim[2].extent = input0->buffer().dim[2].extent/3;
+        if (input0->buffer().dimensions == 3) {
+            auto param = op->main_as_FmhaV2Param();
+            int packedDim = input0->buffer().dim[2].extent;
+            int outputDim = packedDim / 3;
+            if (nullptr != param && param->heads() > 0 && packedDim > param->heads() &&
+                packedDim % 3 != 0 && (packedDim - param->heads()) % 3 == 0) {
+                outputDim = (packedDim - param->heads()) / 3;
+            }
+            output0->buffer().dim[0].extent = input0->buffer().dim[0].extent;
+            output0->buffer().dim[1].extent = input0->buffer().dim[1].extent;
+            output0->buffer().dim[2].extent = outputDim;
+        } else if ((inputs.size() == 3 || inputs.size() == 4) && input0->buffer().dimensions == 4) {
+            output0->buffer().dim[0].extent = input0->buffer().dim[0].extent;
+            output0->buffer().dim[1].extent = input0->buffer().dim[1].extent;
+            output0->buffer().dim[2].extent = input0->buffer().dim[2].extent * input0->buffer().dim[3].extent;
+        } else {
+            return false;
+        }
         output0->buffer().dimensions = 3;
         //MNN_PRINT("fmhaV2 shape:%d %d, %d %d %d %d %d\n", input0->buffer().dimensions, output0->buffer().dimensions, input0->buffer().dim[0].extent, input0->buffer().dim[1].extent, input0->buffer().dim[2].extent, input0->buffer().dim[3].extent, input0->buffer().dim[4].extent);
         //MNN_ASSERT(input0->buffer().dim[3].extent == 3);
@@ -132,4 +148,3 @@ REGISTER_SHAPE_INPUTS_TRANSFORMER_FUSE(LinearAttentionSizeComputer, OpType_Linea
 #endif
 
 } // namespace MNN
-

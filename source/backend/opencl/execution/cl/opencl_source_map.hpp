@@ -357,7 +357,7 @@ const std::map<std::string, std::string> OpenCLProgramMd5Map =
   { "interp", "e549db5550b01a0bf984151d306cab9a" },
   { "select", "34f95349775e0610d5e6d16ae0047797" },
   { "range_buf", "427ab3d6f9ad0cafd08a0b08264df779" },
-  { "self_attention_buf", "653a99a0693d9173084de43e577f9cfd" },
+  { "self_attention_buf", "2ed5b76483969b9c2b3800e2fd0aa78b" },
   { "winogradTransformSource2_3_1", "5cae94a94c822b4b6f82e238ab518f4a" },
   { "gemv_conv1x1_buf", "c345830afdfa6154633950e4a7f9e60e" },
   { "raster", "0cf8ee1f7927d0027ce0f07ad564266e" },

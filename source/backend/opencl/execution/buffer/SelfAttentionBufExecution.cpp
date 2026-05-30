@@ -33,9 +33,16 @@ int SelfAttentionBufImpl::getLocalSize(int size, int maxGroupSize){
 // [B, seqlen, HeadNum*3*HeadDim] -> [B, seqlen, HeadNum*HeadDim]
 ErrorCode SelfAttentionBufImpl::onResize(Backend *backend, const std::vector<Tensor *> &inputs, const std::vector<Tensor *> &outputs) {
     mOpenCLBackend = static_cast<OpenCLBackend *>(backend);
-    mOpenCLBackend->startRecord(mRecording);
-    
+    if (inputs.empty() || inputs.size() > 4) {
+        return NOT_SUPPORT;
+    }
     auto input = inputs[0];// [Batch, seqLen, mNumHead * 3 * mHeadDim]
+    if (input->dimensions() != 3) {
+        return NOT_SUPPORT;
+    }
+    const bool applyRotary = inputs.size() == 3 || inputs.size() == 4;
+    const bool applyGate = inputs.size() == 2 || inputs.size() == 4;
+    const int gateIndex = inputs.size() == 2 ? 1 : (inputs.size() == 4 ? 3 : -1);
 
     auto runtime = mOpenCLBackend->getOpenCLRuntime();
     auto shape = input->shape();
@@ -44,8 +51,28 @@ ErrorCode SelfAttentionBufImpl::onResize(Backend *backend, const std::vector<Ten
     int tile_k = 4; // for gemm alignment
     int batch = shape[0];
     int seq_len = shape[1];
+    if (mNumHead <= 0 || shape[2] <= 0 || shape[2] % (mNumHead * 3) != 0) {
+        return NOT_SUPPORT;
+    }
     mHeadDim = shape[2] / mNumHead / 3;
     mScale = 1.0 / sqrt(mHeadDim);
+    if (applyRotary) {
+        if (inputs[1]->dimensions() != 4 || inputs[2]->dimensions() != 4) {
+            return NOT_SUPPORT;
+        }
+        if (inputs[1]->length(1) != seq_len || inputs[2]->length(1) != seq_len ||
+            inputs[1]->length(3) * 2 != mHeadDim || inputs[2]->length(3) * 2 != mHeadDim) {
+            return NOT_SUPPORT;
+        }
+    }
+    if (applyGate && (inputs[gateIndex]->dimensions() != 3 ||
+                      inputs[gateIndex]->length(0) != batch ||
+                      inputs[gateIndex]->length(1) != seq_len ||
+                      inputs[gateIndex]->length(2) != mNumHead)) {
+        return NOT_SUPPORT;
+    }
+
+    mOpenCLBackend->startRecord(mRecording);
     
     if(mOpenCLBackend->getPrecision() != BackendConfig::Precision_High){
         mByte = 2;
@@ -128,6 +155,9 @@ ErrorCode SelfAttentionBufImpl::onResize(Backend *backend, const std::vector<Ten
             if((seq_len % 4) != 0){
                 buildOption.emplace("-DSEQLEN_LEAVE");
             }
+            if (applyRotary) {
+                buildOption.emplace("-DAPPLY_ROTARY");
+            }
             
             int seq_len_pack_mn = ROUND_UP(seq_len, tile_mn);
             int head_dim_pack_mn = ROUND_UP(mHeadDim, tile_mn);
@@ -148,6 +178,9 @@ ErrorCode SelfAttentionBufImpl::onResize(Backend *backend, const std::vector<Ten
             ret |= mKernel_split[seq_idx]->get().setArg(index++, mGlobalWorkSizeSplit[seq_idx][1]);
             ret |= mKernel_split[seq_idx]->get().setArg(index++, mGlobalWorkSizeSplit[seq_idx][2]);
             ret |= mKernel_split[seq_idx]->get().setArg(index++, openCLBuffer(input));
+            ret |= mKernel_split[seq_idx]->get().setArg(index++, openCLBuffer(applyRotary ? inputs[1] : input));
+            ret |= mKernel_split[seq_idx]->get().setArg(index++, openCLBuffer(applyRotary ? inputs[2] : input));
+            ret |= mKernel_split[seq_idx]->get().setArg(index++, applyRotary ? inputs[1]->length(0) : 0);
             ret |= mKernel_split[seq_idx]->get().setArg(index++, openCLBuffer(mTempQ.get()));
             ret |= mKernel_split[seq_idx]->get().setArg(index++, openCLBuffer(mTempK.get()));
             ret |= mKernel_split[seq_idx]->get().setArg(index++, openCLBuffer(mTempV.get()));
@@ -412,6 +445,9 @@ ErrorCode SelfAttentionBufImpl::onResize(Backend *backend, const std::vector<Ten
             // QKV :   [Batch * mNumHead, ROUND_UP(mHeadDim, tile_mn), ROUND_UP(seqLen, tile_mn)] -> [B, N, M]
             // output: [Batch, seqLen, mNumHead * mHeadDim]
             std::set<std::string> buildOption;
+            if (applyGate) {
+                buildOption.emplace("-DAPPLY_GATE");
+            }
             
             mKernel_clip[seq_idx] = runtime->buildKernel("self_attention_buf", "clip_transpose_qkv", buildOption, mOpenCLBackend->getPrecision(), inputs[0], outputs[0]);
             auto maxWorkGroupSize  = static_cast<uint32_t>(runtime->getMaxWorkGroupSize(mKernel_clip[seq_idx]));
@@ -427,6 +463,7 @@ ErrorCode SelfAttentionBufImpl::onResize(Backend *backend, const std::vector<Ten
             ret |= mKernel_clip[seq_idx]->get().setArg(index++, mGlobalWorkSizeClip[seq_idx][2]);
             ret |= mKernel_clip[seq_idx]->get().setArg(index++, openCLBuffer(mTempQKV.get()));
             ret |= mKernel_clip[seq_idx]->get().setArg(index++, openCLBuffer(outputs[0]));
+            ret |= mKernel_clip[seq_idx]->get().setArg(index++, openCLBuffer(applyGate ? inputs[gateIndex] : input));
             ret |= mKernel_clip[seq_idx]->get().setArg(index++, tile_mn);
             ret |= mKernel_clip[seq_idx]->get().setArg(index++, seq_len);
             ret |= mKernel_clip[seq_idx]->get().setArg(index++, seq_len_piece);

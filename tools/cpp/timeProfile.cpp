@@ -41,8 +41,8 @@ static inline std::vector<int> parseIntList(const std::string& str, char delim) 
 int main(int argc, const char* argv[]) {
     if (argc < 2) {
         MNN_PRINT("=========================================================================================\n");
-        MNN_PRINT("Arguments: model.MNN runLoops forwardType inputSize numberThread precision sparsity cpuIds\n");
-        MNN_PRINT("Example: %s model.MNN 100 0 1x3x224x224 4 0 0 0,1,2,3\n", argv[0]);
+        MNN_PRINT("Arguments: model.MNN runLoops forwardType inputSize numberThread precision sparsity cpuIds attentionOption\n");
+        MNN_PRINT("Example: %s model.MNN 100 0 1x3x224x224 4 0 0 0,1,2,3 16\n", argv[0]);
         MNN_PRINT("=========================================================================================\n");
         return -1;
     }
@@ -104,6 +104,12 @@ int main(int argc, const char* argv[]) {
     }
     MNN_PRINT("\n");
 
+    int attentionOption = 0;
+    if (argc > 9) {
+        attentionOption = ::atoi(argv[9]);
+        MNN_PRINT("Use attention option: %d\n", attentionOption);
+    }
+
 
     // revert MNN model if necessary
     auto revertor = std::unique_ptr<Revert>(new Revert(fileName));
@@ -120,6 +126,9 @@ int main(int argc, const char* argv[]) {
     revertor.reset();
     net->setSessionMode(Interpreter::Session_Debug);
     net->setSessionHint(Interpreter::HintMode::CPU_CORE_IDS, cpuIds.data(), cpuIds.size());
+    if (attentionOption > 0) {
+        net->setSessionHint(Interpreter::HintMode::ATTENTION_OPTION, attentionOption);
+    }
 
     // create session
     MNN::ScheduleConfig config;

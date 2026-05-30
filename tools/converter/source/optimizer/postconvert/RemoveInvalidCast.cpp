@@ -38,23 +38,28 @@ public:
         return false;
     }
     virtual bool onExecute(std::unique_ptr<MNN::NetT>& net) const override {
-        if (net->sourceType == MNN::NetSource_TENSORFLOW || net->sourceType == MNN::NetSource_TFLITE) {
-            // The two framework has valid src type for cast, don't need treat
-            return true;
-        }
-        if (net->sourceType == MNN::NetSource_CAFFE) {
-            // For caffe has no invalid cast op
-            return true;
-        }
         bool needTreat = false;
+        bool hasInvalidSourceCast = false;
         for (auto iter = net->oplists.begin(); iter != net->oplists.end(); iter++) {
             auto& op = *iter;
             if (op->type == MNN::OpType_Cast) {
                 needTreat = true;
-                break;
+                auto cast = op->main.AsCastParam();
+                if (nullptr != cast && cast->srcT == MNN::DataType_DT_INVALID) {
+                    hasInvalidSourceCast = true;
+                }
             }
         }
         if (!needTreat) {
+            return true;
+        }
+        if ((net->sourceType == MNN::NetSource_TENSORFLOW || net->sourceType == MNN::NetSource_TFLITE) && !hasInvalidSourceCast) {
+            // These frameworks normally carry valid src type for cast.
+            return true;
+        }
+        if (net->sourceType == MNN::NetSource_CAFFE && !hasInvalidSourceCast) {
+            // Native Caffe should not need invalid-cast repair. MNN Expr saved models
+            // also use CAFFE sourceType, so keep treating them when invalid Casts exist.
             return true;
         }
         // Infer DataType for All Tensor
@@ -77,6 +82,10 @@ public:
                 case MNN::OpType_GridSample:
                 case MNN::OpType_RNNSequenceGRU:
                 case MNN::OpType_MatMul:
+                case MNN::OpType_BatchMatMul:
+                case MNN::OpType_Attention:
+                case MNN::OpType_FmhaV2:
+                case MNN::OpType_LinearAttention:
                     types[op->inputIndexes[0]] = MNN::DataType_DT_FLOAT;
                     if (op->outputIndexes.size() == 1) {
                         // 4 is integer matmul
@@ -119,6 +128,9 @@ public:
                 case MNN::OpType_Range:
                     types[op->outputIndexes[0]] = types[op->inputIndexes[0]];
                     break;
+                case MNN::OpType_UnaryOp:
+                    types[op->outputIndexes[0]] = types[op->inputIndexes[0]];
+                    break;
                 case MNN::OpType_Shape:
                 case MNN::OpType_Size:
                 case MNN::OpType_Rank:
@@ -158,7 +170,11 @@ public:
                     if (outputBool(op->main.AsBinaryOp()->opType)) {
                         types[op->outputIndexes[0]] = DataType_DT_BOOL;
                     } else {
-                        types[op->outputIndexes[0]] = types[op->inputIndexes[0]];
+                        auto firstType = types[op->inputIndexes[0]];
+                        if (firstType == MNN::DataType_DT_INVALID && op->inputIndexes.size() > 1) {
+                            firstType = types[op->inputIndexes[1]];
+                        }
+                        types[op->outputIndexes[0]] = firstType;
                     }
                 }
                     break;
