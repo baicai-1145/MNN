@@ -269,6 +269,7 @@ private:
     std::shared_ptr<BufferAllocator> mBufferPool;
     std::shared_ptr<BufferAllocator> mBufferPoolShapeImmutable;
     std::atomic<bool> mGPUEnabledSwitch;
+    id<NSObject> mActiveObserver;
     id<NSObject> mForegroundObserver;
     id<NSObject> mBackgroundObserver;
 

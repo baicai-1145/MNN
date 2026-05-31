@@ -158,7 +158,10 @@ void MetalBackend::setUpGPUEnabledSwitch() {
         });
         dispatch_semaphore_wait(latch, DISPATCH_TIME_FOREVER);
     }
-    mGPUEnabledSwitch.store(state == UIApplicationStateActive);
+    mGPUEnabledSwitch.store(state != UIApplicationStateBackground);
+    mActiveObserver = [[NSNotificationCenter defaultCenter] addObserverForName:UIApplicationDidBecomeActiveNotification object:nil queue:nil usingBlock:^(NSNotification * _Nonnull notification) {
+        mGPUEnabledSwitch.store(true);
+    }];
     mForegroundObserver = [[NSNotificationCenter defaultCenter] addObserverForName:UIApplicationWillEnterForegroundNotification object:nil queue:nil usingBlock:^(NSNotification * _Nonnull notification) {
         mGPUEnabledSwitch.store(true);
     }];
@@ -170,6 +173,7 @@ void MetalBackend::setUpGPUEnabledSwitch() {
 
 void MetalBackend::removeNotificationsObservers() {
 #if defined(TARGET_OS_IPHONE) && TARGET_OS_IPHONE
+    [[NSNotificationCenter defaultCenter] removeObserver:mActiveObserver];
     [[NSNotificationCenter defaultCenter] removeObserver:mForegroundObserver];
     [[NSNotificationCenter defaultCenter] removeObserver:mBackgroundObserver];
 #endif
