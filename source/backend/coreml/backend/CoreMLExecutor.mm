@@ -9,8 +9,25 @@
 #include "CoreMLDefine.h"
 #import "CoreMLExecutor.h"
 
+#import <CommonCrypto/CommonDigest.h>
+#import <mach/mach.h>
+
+#include <algorithm>
+#include <chrono>
+#include <cctype>
+#include <cstdio>
+#include <cstdlib>
+#include <iomanip>
 #include <fstream>
+#include <limits>
 #include <iostream>
+#include <memory>
+#include <mutex>
+#include <sstream>
+#include <string>
+#include <unordered_map>
+#include <utility>
+#include <vector>
 
 bool isAvailable() {
 #if !defined(__APPLE__)
@@ -34,7 +51,210 @@ NSURL* createTemporaryFile() {
     NSURL* temporaryFileURL = [temporaryDirectoryURL URLByAppendingPathComponent:temporaryFilename];
     return temporaryFileURL;
 }
+
+std::string lowerAndDash(std::string value) {
+    std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) {
+        return static_cast<char>(std::tolower(c));
+    });
+    std::replace(value.begin(), value.end(), '_', '-');
+    return value;
+}
+
+bool envFlagEnabled(const char* name) {
+    const char* raw = std::getenv(name);
+    if (raw == nullptr || raw[0] == '\0') {
+        return false;
+    }
+    const auto value = lowerAndDash(raw);
+    return !(value == "0" || value == "false" || value == "off" || value == "none");
+}
+
+struct CoreMLProfileCounter {
+    double total_ms = 0.0;
+    int calls = 0;
+};
+
+std::mutex& coreMLProfileMutex() {
+    static auto* mutex = new std::mutex;
+    return *mutex;
+}
+
+std::unordered_map<std::string, CoreMLProfileCounter>& coreMLProfileCounters() {
+    static auto* counters = new std::unordered_map<std::string, CoreMLProfileCounter>;
+    return *counters;
+}
+
+void printCoreMLProfile() {
+    std::vector<std::pair<std::string, CoreMLProfileCounter>> rows;
+    {
+        std::lock_guard<std::mutex> lock(coreMLProfileMutex());
+        const auto& counters = coreMLProfileCounters();
+        rows.reserve(counters.size());
+        for (const auto& item : counters) {
+            rows.push_back(item);
+        }
+    }
+    if (rows.empty()) {
+        return;
+    }
+    std::sort(rows.begin(), rows.end(), [](const std::pair<std::string, CoreMLProfileCounter>& a,
+                                           const std::pair<std::string, CoreMLProfileCounter>& b) {
+        return a.second.total_ms > b.second.total_ms;
+    });
+    std::fprintf(stderr, "\n[MNN CoreML backend profile]\n");
+    std::fprintf(stderr, "%-34s %12s %9s %10s\n", "stage", "total_ms", "calls", "avg_ms");
+    for (const auto& row : rows) {
+        const auto& counter = row.second;
+        const double avg = counter.calls > 0 ? counter.total_ms / counter.calls : 0.0;
+        std::fprintf(stderr, "%-34s %12.2f %9d %10.2f\n",
+                     row.first.c_str(), counter.total_ms, counter.calls, avg);
+    }
+}
+
+bool coreMLProfileEnabled() {
+    static const bool enabled = []() {
+        const bool result = envFlagEnabled("MNN_COREML_PROFILE");
+        if (result) {
+            std::atexit(printCoreMLProfile);
+        }
+        return result;
+    }();
+    return enabled;
+}
+
+double elapsedMs(std::chrono::steady_clock::time_point start) {
+    const auto elapsed = std::chrono::steady_clock::now() - start;
+    return std::chrono::duration<double, std::milli>(elapsed).count();
+}
+
+uint64_t currentResidentBytes() {
+    mach_task_basic_info info;
+    mach_msg_type_number_t count = MACH_TASK_BASIC_INFO_COUNT;
+    const kern_return_t status = task_info(mach_task_self(),
+                                           MACH_TASK_BASIC_INFO,
+                                           reinterpret_cast<task_info_t>(&info),
+                                           &count);
+    if (status != KERN_SUCCESS) {
+        return 0;
+    }
+    return static_cast<uint64_t>(info.resident_size);
+}
+
+void appendCoreMLTrace(const std::string& message) {
+    const char* path = std::getenv("MNN_COREML_TRACE_FILE");
+    if (path == nullptr || path[0] == '\0') {
+        return;
+    }
+    std::ofstream out(path, std::ios::out | std::ios::app);
+    if (!out) {
+        return;
+    }
+    out << message << " resident=" << currentResidentBytes() << "\n";
+}
+
+void recordCoreMLProfile(const std::string& stage, double ms) {
+    if (!coreMLProfileEnabled()) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(coreMLProfileMutex());
+    auto& counter = coreMLProfileCounters()[stage];
+    counter.total_ms += ms;
+    counter.calls += 1;
+}
+
+class ScopedCoreMLProfile {
+public:
+    explicit ScopedCoreMLProfile(std::string stage)
+        : stage_(std::move(stage)), enabled_(coreMLProfileEnabled()), start_(std::chrono::steady_clock::now()) {}
+
+    ~ScopedCoreMLProfile() {
+        if (enabled_) {
+            recordCoreMLProfile(stage_, elapsedMs(start_));
+        }
+    }
+
+private:
+    std::string stage_;
+    bool enabled_ = false;
+    std::chrono::steady_clock::time_point start_;
+};
+
+NSString* coreMLCacheDirectoryFromEnvironment() {
+    const char* raw = std::getenv("MNN_COREML_CACHE_DIR");
+    if (raw == nullptr || raw[0] == '\0') {
+        return nil;
+    }
+    const std::string value(raw);
+    const auto normalized = lowerAndDash(value);
+    if (normalized == "0" || normalized == "false" || normalized == "off" || normalized == "none") {
+        return nil;
+    }
+    NSString* path = nil;
+    if (normalized == "1" || normalized == "true" || normalized == "default") {
+        path = [NSTemporaryDirectory() stringByAppendingPathComponent:@"mnn-coreml-cache-v1"];
+    } else {
+        path = [NSString stringWithUTF8String:raw];
+        path = [path stringByExpandingTildeInPath];
+    }
+    return [path stringByStandardizingPath];
+}
+
+std::string sha256Hex(const uint8_t* data, size_t size) {
+    unsigned char digest[CC_SHA256_DIGEST_LENGTH];
+    CC_SHA256_CTX ctx;
+    CC_SHA256_Init(&ctx);
+    while (size > 0) {
+        const auto chunk = static_cast<CC_LONG>(std::min<size_t>(size, std::numeric_limits<CC_LONG>::max()));
+        CC_SHA256_Update(&ctx, data, chunk);
+        data += chunk;
+        size -= chunk;
+    }
+    CC_SHA256_Final(digest, &ctx);
+
+    std::ostringstream stream;
+    stream << std::hex << std::setfill('0');
+    for (unsigned char byte : digest) {
+        stream << std::setw(2) << static_cast<int>(byte);
+    }
+    return stream.str();
+}
+
+MLComputeUnits computeUnitsFromEnvironment() {
+    const char* raw = std::getenv("MNN_COREML_COMPUTE_UNITS");
+    if (raw == nullptr || raw[0] == '\0') {
+        return MLComputeUnitsAll;
+    }
+
+    const auto value = lowerAndDash(raw);
+
+    if (value == "all" || value == "default" || value == "cpu-gpu-ne" || value == "cpu-gpu-ane") {
+        return MLComputeUnitsAll;
+    }
+    if (value == "cpu" || value == "cpu-only" || value == "cpuonly") {
+        return MLComputeUnitsCPUOnly;
+    }
+    if (value == "gpu" || value == "cpu-gpu" || value == "cpuandgpu") {
+        return MLComputeUnitsCPUAndGPU;
+    }
+    if (value == "ne" || value == "ane" || value == "npu" || value == "cpu-ne" ||
+        value == "cpu-ane" || value == "neural-engine" || value == "cpuandneuralengine") {
+        if (@available(macOS 13.0, iOS 16.0, tvOS 16.0, watchOS 9.0, *)) {
+            return MLComputeUnitsCPUAndNeuralEngine;
+        }
+        NSLog(@"MNN_COREML_COMPUTE_UNITS=%s requires macOS 13 / iOS 16; using MLComputeUnitsAll", raw);
+        return MLComputeUnitsAll;
+    }
+
+    NSLog(@"Unknown MNN_COREML_COMPUTE_UNITS=%s; using MLComputeUnitsAll", raw);
+    return MLComputeUnitsAll;
+}
 }  // namespace
+
+@interface CoreMLExecutor ()
+@property NSString* modelCacheKey;
+@property BOOL compiledModelIsCached;
+- (NSURL*)cacheURLForCurrentModel;
+@end
 
 @interface MultiArrayFeatureProvider : NSObject <MLFeatureProvider> {
     NSMutableDictionary* _inputs;
@@ -121,6 +341,8 @@ NSURL* createTemporaryFile() {
 @implementation CoreMLExecutor
 - (bool)invokeWithInputs:(const std::vector<std::pair<const MNN::Tensor*, std::string>>&)inputs
                  outputs:(const std::vector<std::pair<const MNN::Tensor*, std::string>>&)outputs {
+    ScopedCoreMLProfile totalProfile("invoke.total");
+    appendCoreMLTrace("coreml.invoke.begin");
     if (_model == nil) {
         return NO;
     }
@@ -130,65 +352,97 @@ NSURL* createTemporaryFile() {
         _outputArray = [NSMutableArray arrayWithCapacity:0];
         NSError* error = nil;
         bool useImage = _precision == 2;
-        MultiArrayFeatureProvider* inputFeature = [[MultiArrayFeatureProvider alloc] initWithInputs:&inputs useImage:useImage coreMlVersion:[self coreMlVersion]];
+        MultiArrayFeatureProvider* inputFeature = nil;
+        {
+            ScopedCoreMLProfile profile("invoke.feature_provider");
+            appendCoreMLTrace("coreml.invoke.feature_provider.begin");
+            inputFeature = [[MultiArrayFeatureProvider alloc] initWithInputs:&inputs useImage:useImage coreMlVersion:[self coreMlVersion]];
+            appendCoreMLTrace(inputFeature == nil ? "coreml.invoke.feature_provider.failed" : "coreml.invoke.feature_provider.end");
+        }
         if (inputFeature == nil) {
             NSLog(@"inputFeature is not initialized.");
             return NO;
         }
         MLPredictionOptions* options = [[MLPredictionOptions alloc] init];
         // options.usesCPUOnly = true;
-        auto _outputFeature = [_model predictionFromFeatures:inputFeature
-                                                options:options
-                                                  error:&error];
+        id<MLFeatureProvider> _outputFeature = nil;
+        {
+            ScopedCoreMLProfile profile("invoke.prediction");
+            appendCoreMLTrace("coreml.invoke.prediction.begin");
+            _outputFeature = [_model predictionFromFeatures:inputFeature
+                                                    options:options
+                                                      error:&error];
+            appendCoreMLTrace(_outputFeature == nil ? "coreml.invoke.prediction.failed" : "coreml.invoke.prediction.end");
+        }
         if (error != nil) {
             NSLog(@"Error executing model: %@", [error localizedDescription]);
             return NO;
         }
-        NSSet<NSString*>* outputFeatureNames = [_outputFeature featureNames];
-        for (auto& output : outputs) {
-            NSString* outputName = [NSString stringWithCString:output.second.c_str()
-                                                      encoding:[NSString defaultCStringEncoding]];
-            MLFeatureValue* outputValue = [_outputFeature featureValueForName:[outputFeatureNames member:outputName]];
-            if ([outputValue type] == MLFeatureTypeImage) {
-                auto data = [outputValue imageBufferValue];
-                CVPixelBufferLockBaseAddress(data, kCVPixelBufferLock_ReadOnly);
-                auto pixelbuffer = (unsigned char*)CVPixelBufferGetBaseAddress(data);
-                auto width = CVPixelBufferGetWidth(data);
-                auto byte_per_row = CVPixelBufferGetBytesPerRow(data);
-                for (int row = 0; row < CVPixelBufferGetHeight(data); row++) {
-                    memcpy(const_cast<MNN::Tensor*>(output.first)->buffer().host + row * width, pixelbuffer + row * byte_per_row, width);
+        {
+            ScopedCoreMLProfile profile("invoke.output_bind");
+            appendCoreMLTrace("coreml.invoke.output_bind.begin");
+            NSSet<NSString*>* outputFeatureNames = [_outputFeature featureNames];
+            for (auto& output : outputs) {
+                NSString* outputName = [NSString stringWithCString:output.second.c_str()
+                                                          encoding:[NSString defaultCStringEncoding]];
+                MLFeatureValue* outputValue = [_outputFeature featureValueForName:[outputFeatureNames member:outputName]];
+                if ([outputValue type] == MLFeatureTypeImage) {
+                    auto data = [outputValue imageBufferValue];
+                    CVPixelBufferLockBaseAddress(data, kCVPixelBufferLock_ReadOnly);
+                    auto pixelbuffer = (unsigned char*)CVPixelBufferGetBaseAddress(data);
+                    auto width = CVPixelBufferGetWidth(data);
+                    auto byte_per_row = CVPixelBufferGetBytesPerRow(data);
+                    for (int row = 0; row < CVPixelBufferGetHeight(data); row++) {
+                        memcpy(const_cast<MNN::Tensor*>(output.first)->buffer().host + row * width, pixelbuffer + row * byte_per_row, width);
+                    }
+                    CVPixelBufferUnlockBaseAddress(data, kCVPixelBufferLock_ReadOnly);
+                } else {
+                    auto* data = [outputValue multiArrayValue];
+                    if (data.dataPointer == nullptr) {
+                        return NO;
+                    }
+                    [_outputArray addObject:data];
+                    const_cast<MNN::Tensor*>(output.first)->buffer().host = (unsigned char*)data.dataPointer;
                 }
-                CVPixelBufferUnlockBaseAddress(data, kCVPixelBufferLock_ReadOnly);
-            } else {
-                auto* data = [outputValue multiArrayValue];
-                if (data.dataPointer == nullptr) {
-                    return NO;
-                }
-                [_outputArray addObject:data];
-                const_cast<MNN::Tensor*>(output.first)->buffer().host = (unsigned char*)data.dataPointer;
-           }
+            }
+            appendCoreMLTrace("coreml.invoke.output_bind.end");
         }
         inputFeature = nil;
     }
+    appendCoreMLTrace("coreml.invoke.end");
     return YES;
 }
 
 - (bool)cleanup {
     NSError* error = nil;
-    [[NSFileManager defaultManager] removeItemAtPath:_mlModelFilePath error:&error];
-    if (error != nil) {
-        NSLog(@"Failed cleaning up model: %@", [error localizedDescription]);
-        return NO;
+    NSFileManager* fileManager = [NSFileManager defaultManager];
+    if (_mlModelFilePath.length > 0 && [fileManager fileExistsAtPath:_mlModelFilePath]) {
+        [fileManager removeItemAtPath:_mlModelFilePath error:&error];
+        if (error != nil) {
+            NSLog(@"Failed cleaning up model: %@", [error localizedDescription]);
+            return NO;
+        }
     }
-    [[NSFileManager defaultManager] removeItemAtPath:_compiledModelFilePath error:&error];
-    if (error != nil) {
-        NSLog(@"Failed cleaning up compiled model: %@", [error localizedDescription]);
-        return NO;
+    if (!_compiledModelIsCached && _compiledModelFilePath.length > 0 &&
+        [fileManager fileExistsAtPath:_compiledModelFilePath]) {
+        [fileManager removeItemAtPath:_compiledModelFilePath error:&error];
+        if (error != nil) {
+            NSLog(@"Failed cleaning up compiled model: %@", [error localizedDescription]);
+            return NO;
+        }
     }
     return YES;
 }
 
 - (NSURL*)saveModel:(CoreML__Specification__Model*)model {
+    return [self saveModel:model forceWrite:NO];
+}
+
+- (NSURL*)saveModel:(CoreML__Specification__Model*)model forceWrite:(BOOL)forceWrite {
+    ScopedCoreMLProfile totalProfile("build.save_model.total");
+    appendCoreMLTrace("coreml.save_model.begin");
+    _modelCacheKey = nil;
+    _compiledModelIsCached = NO;
     NSURL* modelUrl = createTemporaryFile();
     NSString* modelPath = [modelUrl path];
     if (model->specificationversion == 3) {
@@ -199,37 +453,158 @@ NSURL* createTemporaryFile() {
         NSLog(@"Only Core ML models with specification version 3 or 4 are supported");
         return nil;
     }
-    size_t modelSize = core_ml__specification__model__get_packed_size(model);
-    std::unique_ptr<uint8_t> writeBuffer(new uint8_t[modelSize]);
-    core_ml__specification__model__pack(model, writeBuffer.get());
+    size_t modelSize = 0;
+    {
+        ScopedCoreMLProfile profile("build.get_packed_size");
+        modelSize = core_ml__specification__model__get_packed_size(model);
+    }
+    appendCoreMLTrace("coreml.save_model.packed_size=" + std::to_string(modelSize));
+    std::unique_ptr<uint8_t[]> writeBuffer(new uint8_t[modelSize]);
+    appendCoreMLTrace("coreml.save_model.write_buffer_allocated");
+    {
+        ScopedCoreMLProfile profile("build.pack_model");
+        core_ml__specification__model__pack(model, writeBuffer.get());
+    }
+    appendCoreMLTrace("coreml.save_model.pack_done");
+    {
+        ScopedCoreMLProfile profile("build.hash_model");
+        const auto hash = sha256Hex(writeBuffer.get(), modelSize);
+        _modelCacheKey = [NSString stringWithFormat:@"mnn-coreml-v1-%s", hash.c_str()];
+    }
+    appendCoreMLTrace("coreml.save_model.hash_done");
+    NSURL* cacheURL = [self cacheURLForCurrentModel];
+    if (!forceWrite && cacheURL != nil && [[NSFileManager defaultManager] fileExistsAtPath:[cacheURL path]]) {
+        recordCoreMLProfile("build.skip_source_write_cache_hit", 0.0);
+        appendCoreMLTrace("coreml.save_model.cache_hit");
+        return nil;
+    }
     // TODO: Can we mmap this instead of actual writing it to phone ?
-    std::ofstream file_stream([modelPath UTF8String], std::ios::out | std::ios::binary);
-    const char* ptr = reinterpret_cast<const char*>(writeBuffer.get());
-    file_stream.write(ptr, modelSize);
+    {
+        ScopedCoreMLProfile profile("build.write_model_file");
+        std::ofstream file_stream([modelPath UTF8String], std::ios::out | std::ios::binary);
+        const char* ptr = reinterpret_cast<const char*>(writeBuffer.get());
+        file_stream.write(ptr, modelSize);
+    }
+    appendCoreMLTrace("coreml.save_model.write_done");
     return modelUrl;
 }
 
-- (bool)build:(NSURL*)modelUrl {
+- (MLModel*)loadCompiledModel:(NSURL*)compileUrl error:(NSError**)error {
+    ScopedCoreMLProfile profile("build.load_mlmodel");
+    appendCoreMLTrace("coreml.load_mlmodel.begin");
+    MLModel* model = nil;
+    if (@available(iOS 12.0, *)) {
+        MLModelConfiguration* config = [[MLModelConfiguration alloc] init];
+        config.computeUnits = computeUnitsFromEnvironment();
+        model = [MLModel modelWithContentsOfURL:compileUrl configuration:config error:error];
+    } else {
+        model = [MLModel modelWithContentsOfURL:compileUrl error:error];
+    }
+    appendCoreMLTrace(model == nil ? "coreml.load_mlmodel.failed" : "coreml.load_mlmodel.end");
+    return model;
+}
+
+- (NSURL*)cacheURLForCurrentModel {
+    ScopedCoreMLProfile profile("build.cache_lookup");
+    NSString* cacheDirectory = coreMLCacheDirectoryFromEnvironment();
+    if (cacheDirectory.length == 0 || _modelCacheKey.length == 0) {
+        return nil;
+    }
     NSError* error = nil;
-    NSURL* compileUrl = [MLModel compileModelAtURL:modelUrl error:&error];
-    if (error != nil) {
-        NSLog(@"Error compiling model %@", [error localizedDescription]);
-        return NO;
+    NSFileManager* fileManager = [NSFileManager defaultManager];
+    if (![fileManager createDirectoryAtPath:cacheDirectory withIntermediateDirectories:YES attributes:nil error:&error]) {
+        NSLog(@"Failed creating CoreML cache directory %@: %@", cacheDirectory, [error localizedDescription]);
+        return nil;
+    }
+    NSString* cacheName = [_modelCacheKey stringByAppendingString:@".mlmodelc"];
+    return [NSURL fileURLWithPath:[cacheDirectory stringByAppendingPathComponent:cacheName] isDirectory:YES];
+}
+
+- (void)copyCompiledModel:(NSURL*)compiledURL toCacheURL:(NSURL*)cacheURL {
+    ScopedCoreMLProfile profile("build.cache_copy");
+    if (compiledURL == nil || cacheURL == nil) {
+        return;
+    }
+    NSFileManager* fileManager = [NSFileManager defaultManager];
+    if ([fileManager fileExistsAtPath:[cacheURL path]]) {
+        return;
+    }
+    NSError* error = nil;
+    if (![fileManager copyItemAtURL:compiledURL toURL:cacheURL error:&error]) {
+        if (![fileManager fileExistsAtPath:[cacheURL path]]) {
+            NSLog(@"Failed caching compiled CoreML model at %@: %@", [cacheURL path], [error localizedDescription]);
+        }
+    }
+}
+
+- (bool)build:(NSURL*)modelUrl {
+    ScopedCoreMLProfile totalProfile("build.total");
+    appendCoreMLTrace("coreml.build.begin");
+    NSError* error = nil;
+    NSFileManager* fileManager = [NSFileManager defaultManager];
+    NSURL* cacheUrl = [self cacheURLForCurrentModel];
+    NSURL* compileUrl = nil;
+    BOOL loadedFromCache = NO;
+
+    if (cacheUrl != nil && [fileManager fileExistsAtPath:[cacheUrl path]]) {
+        compileUrl = cacheUrl;
+        loadedFromCache = YES;
+        appendCoreMLTrace("coreml.build.cache_hit");
+    }
+
+    if (compileUrl == nil) {
+        if (modelUrl == nil) {
+            NSLog(@"CoreML cache miss but no source model file is available for compilation");
+            return NO;
+        }
+        {
+            ScopedCoreMLProfile profile("build.compile_model");
+            appendCoreMLTrace("coreml.compile.begin");
+            compileUrl = [MLModel compileModelAtURL:modelUrl error:&error];
+            appendCoreMLTrace(compileUrl == nil ? "coreml.compile.failed" : "coreml.compile.end");
+        }
+        if (error != nil) {
+            NSLog(@"Error compiling model %@", [error localizedDescription]);
+            return NO;
+        }
+        [self copyCompiledModel:compileUrl toCacheURL:cacheUrl];
     }
     _mlModelFilePath = [modelUrl path];
     _compiledModelFilePath = [compileUrl path];
+    _compiledModelIsCached = loadedFromCache;
 
-    if (@available(iOS 12.0, *)) {
-        MLModelConfiguration* config = [MLModelConfiguration alloc];
-        config.computeUnits = MLComputeUnitsAll;
-        _model = [MLModel modelWithContentsOfURL:compileUrl configuration:config error:&error];
-    } else {
-        _model = [MLModel modelWithContentsOfURL:compileUrl error:&error];
+    appendCoreMLTrace("coreml.build.load_begin");
+    _model = [self loadCompiledModel:compileUrl error:&error];
+    if (error != nil && loadedFromCache) {
+        NSLog(@"Error loading cached CoreML model %@; recompiling. %@", [compileUrl path], [error localizedDescription]);
+        [fileManager removeItemAtURL:compileUrl error:nil];
+        if (modelUrl == nil) {
+            NSLog(@"Cannot recompile cached CoreML model because the source model file was skipped");
+            return NO;
+        }
+        error = nil;
+        {
+            ScopedCoreMLProfile profile("build.recompile_model");
+            appendCoreMLTrace("coreml.recompile.begin");
+            compileUrl = [MLModel compileModelAtURL:modelUrl error:&error];
+            appendCoreMLTrace(compileUrl == nil ? "coreml.recompile.failed" : "coreml.recompile.end");
+        }
+        if (error != nil) {
+            NSLog(@"Error compiling model %@", [error localizedDescription]);
+            return NO;
+        }
+        [self copyCompiledModel:compileUrl toCacheURL:cacheUrl];
+        _compiledModelFilePath = [compileUrl path];
+        _compiledModelIsCached = NO;
+        error = nil;
+        appendCoreMLTrace("coreml.build.reload_begin");
+        _model = [self loadCompiledModel:compileUrl error:&error];
     }
     if (error != NULL) {
         NSLog(@"Error Creating MLModel %@", [error localizedDescription]);
         return NO;
     }
+    appendCoreMLTrace("coreml.build.end");
     return YES;
 }
 @end

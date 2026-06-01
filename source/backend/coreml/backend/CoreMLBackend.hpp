@@ -10,8 +10,10 @@
 #define MNN_COREMLBACKEND_H
 
 #include <stdio.h>
+#include <functional>
 #include <map>
 #include <memory>
+#include <vector>
 #include <MNN/ErrorCode.hpp>
 #include <core/Backend.hpp>
 #include <core/Execution.hpp>
@@ -64,37 +66,15 @@ namespace MNN {
         virtual ErrorCode onResizeEnd() override;
 
     public:
-        // TODO: using memory pool instead static factory
-        template <class T> class PtrContainer {
-            std::vector<T*> ptr_container;
-            std::vector<T*> array_container;
-        public:
-            ~PtrContainer() {
-                for (auto t : ptr_container) {
-                    delete t;
-                }
-                for (auto t : array_container) {
-                    delete [] t;
-                }
-            }
-            void insert(T* t) {
-                ptr_container.push_back(t);
-            }
-            void add(T* t) {
-                array_container.push_back(t);
-            }
-        };
         // create C struct pointer
         template <class T> T* create() {
-            static PtrContainer<T> con;
             auto t = new T;
-            con.insert(t);
+            mCoreMLOwnedPtrs.emplace_back([t]() { delete t; });
             return t;
         }
         template <class T> T* create(size_t size) {
-            static PtrContainer<T> con;
             auto t = new T[size];
-            con.add(t);
+            mCoreMLOwnedPtrs.emplace_back([t]() { delete [] t; });
             return t;
         }
         std::string getTensorName(const Tensor* t);
@@ -118,6 +98,7 @@ namespace MNN {
         static bool addCreator(OpType t, Creator* c);
     private:
         std::unique_ptr<_CoreML__Specification__Model> mCoreMLModel_;
+        std::vector<std::function<void()>> mCoreMLOwnedPtrs;
         std::vector<CoreML__Specification__NeuralNetworkLayer*> mCoreMLLayerPtrs;
 
         std::map<const Tensor*, int> mTensorIdxMap, mInputIdxMap, mOutputIdxMap;

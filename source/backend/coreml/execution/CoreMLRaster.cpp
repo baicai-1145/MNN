@@ -293,6 +293,11 @@ bool CoreMLRaster::rasterOptimization(const std::vector<Tensor *> &inputs, const
         if (region.origin->dimensions() != dim) {
             return false;
         }
+        for (const auto& reg : regions) {
+            if (!TensorUtils::isCopyRegion(reg) || reg.src.offset != 0) {
+                return false;
+            }
+        }
         int axis = -1;
         for (int i = 0; i < outputs[0]->dimensions(); i++) {
             if (region.origin->length(i) != outputs[0]->length(i)) {

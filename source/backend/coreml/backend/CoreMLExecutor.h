@@ -29,6 +29,7 @@ struct Region {
 - (bool)invokeWithInputs:(const std::vector<std::pair<const MNN::Tensor*, std::string>>&)inputs
                  outputs:(const std::vector<std::pair<const MNN::Tensor*, std::string>>&)outputs API_AVAILABLE(ios(11));
 - (NSURL*)saveModel:(CoreML__Specification__Model*)model API_AVAILABLE(ios(11));
+- (NSURL*)saveModel:(CoreML__Specification__Model*)model forceWrite:(BOOL)forceWrite API_AVAILABLE(ios(11));
 - (bool)build:(NSURL*)modelUrl API_AVAILABLE(ios(11));
 - (bool)cleanup;
 

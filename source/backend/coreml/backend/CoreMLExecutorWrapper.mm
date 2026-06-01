@@ -41,6 +41,14 @@ bool CoreMLExecutorWrapper::compileModel(CoreML__Specification__Model* model) {
         auto executor = getCoreMLExecutoreRef(mCoreMLExecutorPtr);
         NSURL* model_url = [executor saveModel:model];
         if (![executor build:model_url]) {
+            if (model_url == nil) {
+                model_url = [executor saveModel:model forceWrite:YES];
+                if (model_url != nil && [executor build:model_url]) {
+                    [executor cleanup];
+                    return true;
+                }
+            }
+            [executor cleanup];
             printf("Failed to Compile and save Model.");
             return false;
         }
